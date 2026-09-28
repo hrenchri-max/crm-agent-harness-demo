@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CRM agent harness: stalled-deal follow-up</title>
+  <meta name="description" content="Reference agent harness for a CRM: rep-scoped tools, approval gates, an append-only event log, idempotent retries and crash recovery.">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="wrap top">
+    <p class="eyebrow">Reference implementation</p>
+    <h1>CRM agent harness</h1>
+    <p class="lede">One flow, end to end. A sales rep asks the agent to follow up on stalled deals. Every tool runs as the rep, every write waits for the rep's approval policy, and every step lands in an append-only event log.</p>
+    <p class="note">The model's steps on this page were written ahead of time in the exact format the Claude API returns. Everything else (the state machine, permission checks, approval gate, retries, audit log and crash recovery) runs live in your browser. <code>npm run live</code> runs the same harness against the real API with your own key. <a href="https://github.com/hrenchri-max/crm-agent-harness-demo">Source and architecture notes</a></p>
+  </header>
+  <main class="wrap" id="app"></main>
+  <script src="./app.js"></script>
+</body>
+</html>

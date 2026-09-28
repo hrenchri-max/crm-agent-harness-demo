@@ -1,0 +1,6 @@
+node_modules/
+runs/
+qa/shots/
+*.log
+.env
+.env.*

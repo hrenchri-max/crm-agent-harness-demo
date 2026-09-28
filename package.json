@@ -1,0 +1,26 @@
+{
+  "name": "crm-agent-harness-demo",
+  "version": "1.0.0",
+  "description": "Reference agent harness for a CRM: tool registry, rep-scoped permissions, approval gates, event-sourced run state, idempotent writes.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "tsx --test test/harness.test.ts",
+    "typecheck": "tsc --noEmit",
+    "live": "tsx src/node/live.ts",
+    "serve": "node scripts/serve.mjs",
+    "qa": "node qa/qa.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.63.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
