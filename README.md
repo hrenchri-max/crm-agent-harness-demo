@@ -4,7 +4,7 @@ A small, framework-free TypeScript harness for agents that work inside a CRM: th
 
 **Live demo:** https://hrenchri-max.github.io/crm-agent-harness-demo/
 
-The page runs the same harness core in your browser. The model's steps there were written ahead of time in the exact format the Claude API returns (a public page cannot hold an API key). Everything else, the state machine, permission checks, approval gate, retries, audit log and crash recovery, runs live. `npm run live` runs the same harness against the real Claude API with your own key.
+The page runs the same harness core in your browser, paced so each step is visible (Skip ahead jumps to the next decision; `?fast=1` turns pacing off). The model's steps there were written ahead of time in the exact format the Claude API returns (a public page cannot hold an API key). Everything else, the state machine, permission checks, approval gate, retries, audit log and crash recovery, runs live. `npm run live` runs the same harness against the real Claude API with your own key.
 
 ## What the demo shows
 

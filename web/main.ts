@@ -1,16 +1,19 @@
 import { Crm, EmailProvider, TODAY, daysBetween, lastActivity } from '../src/core/crm.ts';
-import { EventStore, Harness, type HarnessDeps } from '../src/core/harness.ts';
+import { EventStore, Harness, type HarnessDeps, type ModelPort } from '../src/core/harness.ts';
 import { DEMO_REP, DEMO_REQUEST, PrewrittenModel, SESSION_2_TEXT } from '../src/core/prewritten-model.ts';
 import { describeEvent } from '../src/core/describe.ts';
-import { digest, memoOf } from '../src/core/state.ts';
-import { TOOL_BY_NAME, actionLabel } from '../src/core/tools.ts';
+import { digest, memoOf, replay } from '../src/core/state.ts';
+import { TOOLS, TOOL_BY_NAME, actionLabel, type ToolDef } from '../src/core/tools.ts';
 import { MAX_RESULT_CHARS, RECENT_TURNS } from '../src/core/context.ts';
 import type { ActionState, ContextInfo, Decision, RunEvent, RunState, RunStatus } from '../src/core/types.ts';
 
 type Tab = 'timeline' | 'crm' | 'memo' | 'audit';
 type Ev<T extends RunEvent['type']> = Extract<RunEvent, { type: T }>;
 
-const MODEL_DELAY_MS = 650;
+// The page paces the run so each step can be followed. ?fast=1 turns pacing off.
+const FAST = new URLSearchParams(location.search).has('fast');
+const PACE = FAST ? { model: 650, tool: 0, gap: 0, retry: [800, 1600] } : { model: 1200, tool: 700, gap: 650, retry: [2000, 4000] };
+const PARKED: RunStatus[] = ['awaiting_approval', 'completed', 'failed', 'cancelled'];
 const REP = 'Jordan Lee';
 const PS = '\n\nP.S. If it is easier, I can send a short written summary first.';
 const desktop = matchMedia('(min-width: 1024px)');
@@ -24,14 +27,59 @@ const parse = (s: string) => { try { return JSON.parse(s); } catch { return s; }
 let crm: Crm, email: EmailProvider, store: EventStore;
 let harness: Harness | null = null;
 let unsubscribe = () => {};
+let SHOWN: readonly RunEvent[] = []; // the events revealed so far; everything on screen renders from these
 const ui = {
   tab: 'timeline' as Tab, mode: {} as Record<string, 'edit' | 'reject'>, drafts: {} as Record<string, Record<string, string>>,
-  errors: {} as Record<string, string>, inflight: new Set<string>(), open: new Set<string>(), follow: false, lastGate: '',
+  errors: {} as Record<string, string>, inflight: new Set<string>(), open: new Set<string>(), lastGate: '',
+  shown: 0, lastVisible: 0, skip: false, stick: false, flashSeq: 0,
 };
 
-const deps = (): HarnessDeps => ({ store, model: new PrewrittenModel(MODEL_DELAY_MS), crm, email });
+// Pacing lives in the dependencies the page hands the harness; the harness itself is unchanged.
+let waiters: (() => void)[] = [];
+function pace(ms: number): Promise<void> {
+  if (ui.skip || !ms) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(t); waiters = waiters.filter((w) => w !== done); resolve(); };
+    const t = setTimeout(done, ms);
+    waiters.push(done);
+  });
+}
+const prewritten = new PrewrittenModel(0);
+const model: ModelPort = { label: prewritten.label, create: async (req) => { await pace(PACE.model); return prewritten.create(req); } };
+const tools: ToolDef[] = TOOLS.map((t) => ({ ...t, handler: async (i, c) => { try { return await t.handler(i, c); } finally { await pace(PACE.tool); } } }));
+const deps = (): HarnessDeps => ({ store, model, crm, email, tools, retryDelaysMs: PACE.retry, sleep: pace });
+
+function visible(e: RunEvent, all: readonly RunEvent[]): boolean {
+  if (e.type === 'model_request' || e.type === 'tool_called' || e.type === 'approval_decided') return false;
+  if (e.type === 'action_proposed') return !e.action.needsApproval;
+  if (e.type === 'state_changed') return PARKED.includes(e.to);
+  if (e.type === 'tool_result') return !e.isError && all.some((c) => c.type === 'tool_called' && c.toolUseId === e.toolUseId && c.kind === 'read');
+  return true;
+}
+
+/** Reveal logged events one at a time, at least PACE.gap apart, and follow the newest one. */
 let frame = 0;
-const schedule = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; render(); }); };
+let timer = 0;
+const schedule = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; pump(); }); };
+function pump() {
+  clearTimeout(timer);
+  const all = store.events;
+  const near = innerHeight + scrollY >= document.documentElement.scrollHeight - 250;
+  let revealed = false;
+  while (ui.shown < all.length) {
+    const e = all[ui.shown];
+    const show = visible(e, all);
+    if (show && !ui.skip) {
+      const wait = ui.lastVisible + PACE.gap - performance.now();
+      if (wait > 0) { timer = window.setTimeout(pump, wait); break; }
+    }
+    if (show) { ui.lastVisible = performance.now(); revealed = true; }
+    ui.shown++;
+    if (e.type === 'state_changed' && PARKED.includes(e.to)) ui.skip = false; // "Skip ahead" stops at the next decision point
+  }
+  render();
+  if (revealed) follow(near);
+}
 function bind() { unsubscribe(); unsubscribe = store.subscribe(schedule); }
 function drive(p: Promise<void>) {
   p.catch((err) => { console.error(err); ui.errors.global = String(err?.message ?? err); render(); });
@@ -40,16 +88,25 @@ function drive(p: Promise<void>) {
 function reset() {
   harness?.crash();
   harness = null;
+  for (const w of [...waiters]) w();
+  clearTimeout(timer);
   crm = new Crm(); email = new EmailProvider(); store = new EventStore();
   bind();
-  Object.assign(ui, { mode: {}, drafts: {}, errors: {}, inflight: new Set(), open: new Set(), follow: false, lastGate: '' });
+  Object.assign(ui, { mode: {}, drafts: {}, errors: {}, inflight: new Set(), open: new Set(), lastGate: '', shown: 0, lastVisible: 0, skip: false, stick: false, flashSeq: 0 });
   render();
 }
 
 function run() {
   harness = Harness.start(deps(), `run_${Date.now().toString(36)}`, DEMO_REP, DEMO_REQUEST);
-  ui.follow = true;
+  ui.stick = true;
   drive(harness.advance());
+}
+
+function skipAhead() {
+  ui.skip = true;
+  ui.stick = true;
+  for (const w of [...waiters]) w();
+  pump();
 }
 
 /** The process "dies": the harness object and its in-memory state are thrown away. Only the serialized log survives. */
@@ -61,8 +118,14 @@ function crashAndResume() {
   bind();
   harness = Harness.recover(deps(), before);
   ui.mode = {};
-  ui.follow = true;
+  ui.shown = store.events.length; // a rebuild is instant: show everything, including the recovery
+  ui.lastVisible = performance.now();
+  ui.flashSeq = store.events.at(-1)!.seq;
+  ui.stick = true;
+  if (!desktop.matches) ui.tab = 'timeline';
   render();
+  panel('timeline').querySelector('.highlight')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  setTimeout(() => { ui.flashSeq = 0; render(); }, 4000);
   drive(harness.advance());
 }
 
@@ -70,7 +133,7 @@ function decide(id: string, decision: Decision) {
   if (!harness || ui.inflight.has(id)) return;
   ui.inflight.add(id);
   delete ui.errors[id];
-  ui.follow = true;
+  ui.stick = true;
   harness.decide(id, decision)
     .then(() => { delete ui.mode[id]; })
     .catch((err) => { ui.errors[id] = err.message; })
@@ -93,7 +156,7 @@ const STATE_LABEL: Record<RunStatus, string> = {
 };
 
 function statesHtml(s?: RunState): string {
-  const seen = new Set(store.events.filter((e) => e.type === 'state_changed').flatMap((e) => [(e as Ev<'state_changed'>).from, (e as Ev<'state_changed'>).to]));
+  const seen = new Set(SHOWN.filter((e) => e.type === 'state_changed').flatMap((e) => [(e as Ev<'state_changed'>).from, (e as Ev<'state_changed'>).to]));
   const order: RunStatus[] = ['running', 'awaiting_approval', 'executing', 'completed'];
   if (s && (s.status === 'failed' || s.status === 'cancelled')) order.push(s.status);
   return order.map((st) => {
@@ -185,7 +248,7 @@ function rejectForm(a: ActionState): string {
 }
 
 function decided(a: ActionState): string {
-  const ev = store.events.find((e) => e.type === 'approval_decided' && e.actionId === a.id);
+  const ev = SHOWN.find((e) => e.type === 'approval_decided' && e.actionId === a.id);
   const when = ev ? ` at ${time(ev.at)}` : '';
   if (!a.decision) return '<div class="decided">Not decided. The run ended first.</div>';
   if (a.decision.type === 'reject') return `<div class="decided bad">Rejected by ${esc(a.decidedBy)}${when}. Reason: "${esc(a.decision.reason)}". Nothing ran; the reason went back to the model.</div>`;
@@ -199,12 +262,12 @@ function gate(s: RunState, turn: number): string {
   const head = waiting
     ? `<h3>Waiting for ${REP}</h3><p>${waiting} of ${acts.length} proposed changes need a decision. The run is parked in <code>awaiting_approval</code> and nothing has been written. Edits and rejection reasons go back to the model.</p><p class="muted">Worth trying here: throw the process away and rebuild this parked run from the event log.</p><div class="actions"><button type="button" data-act="crash">Simulate crash + resume</button></div>`
     : `<h3>Approval gate</h3><p class="muted">${acts.length} changes needed a decision from ${REP}.</p>`;
-  return `<section class="gate" id="gate-${turn}">${head}${acts.map((a) => approval(a, s)).join('')}</section>`;
+  return `<section class="gate${waiting ? ' open' : ''}" id="gate-${turn}">${head}${acts.map((a) => approval(a, s)).join('')}</section>`;
 }
 
 function execution(s: RunState, id: string): string {
   const a = s.actions[id];
-  const evs = store.events.filter((e) => (e as any).actionId === id || e.type === 'recovered');
+  const evs = SHOWN.filter((e) => (e as any).actionId === id || e.type === 'recovered');
   const i = a.finalInput;
   const label = a.tool === 'send_email' ? `Send email to ${contact(i.to_contact_id)?.name}` : a.tool === 'create_task' ? `Create task on ${i.deal_id}` : `Move ${i.deal_id} to ${i.stage}`;
   const lines: string[] = [];
@@ -218,6 +281,9 @@ function execution(s: RunState, id: string): string {
     if (e.type === 'action_executed') lines.push((e.result as any)?.deduplicated ? 'The provider had already accepted a message with this key, so it returned the original instead of sending again. Sent exactly once.' : 'Done.');
     if (e.type === 'action_failed') lines.push(`Failed (${e.kind}): ${esc(e.error)}`);
   }
+  const mine = evs.filter((e) => (e as any).actionId === id);
+  const last = mine.at(-1);
+  if (last?.type === 'action_retry_scheduled') lines.push(`<span class="waiting">Waiting ${last.delayMs / 1000} s before the next attempt</span>`);
   return step(`exec${a.status === 'failed' ? ' bad' : ''}`, esc(label), `<span class="tag">${a.tool}</span>`, `<ol>${lines.map((l) => `<li>${l}</li>`).join('')}</ol>`);
 }
 
@@ -227,13 +293,13 @@ function recovered(e: Ev<'recovered'>): string {
     executing: 'Execution continues. Finished actions are skipped, and an interrupted one retries with its original idempotency key.',
     running: 'The model call that was in flight is simply made again.',
   };
-  return step('info', 'Simulated crash, then recovery', `<span class="meta">${time(e.at)}</span>`,
+  return step(`info${e.seq === ui.flashSeq ? ' highlight' : ''}`, 'Simulated crash, then recovery', `<span class="meta">${time(e.at)}</span>`,
     `<p>The in-memory harness was thrown away. A new one loaded the saved event log, replayed ${e.replayed} events and rebuilt the run.</p><dl class="ctx"><dt>Status</dt><dd>${STATE_LABEL[e.status]}</dd><dt>Digest before</dt><dd><code>${e.digestBefore}</code></dd><dt>Digest after</dt><dd><code>${e.digestAfter}</code> ${e.digestBefore === e.digestAfter ? '(identical)' : '(different)'}</dd></dl><p class="muted">${hint[e.status] ?? 'Nothing was left to do.'}</p>`);
 }
 
 function timelineHtml(s?: RunState): string {
   if (!s) return `<p class="intro">Press Run. The agent looks for ${REP}'s deals with no activity in 14 or more days, reads their history and proposes follow-ups. Nothing is written until the approval policy allows it. Today in the demo CRM is ${TODAY}.</p>`;
-  const ev = store.events;
+  const ev = SHOWN;
   const results = new Map(ev.filter((e): e is Ev<'tool_result'> => e.type === 'tool_result').map((e) => [e.toolUseId, e]));
   const calls = new Map(ev.filter((e): e is Ev<'tool_called'> => e.type === 'tool_called').map((e) => [e.toolUseId, e]));
   const out: string[] = [];
@@ -299,7 +365,7 @@ function memoHtml(s?: RunState): string {
 }
 
 function auditHtml(): string {
-  const ev = store.events;
+  const ev = SHOWN;
   if (!ev.length) return '<p class="intro">Every event of the run lands here: model turns, tool calls and inputs, results, permission denials, retries and approval decisions, each with who and when.</p>';
   return `<p class="intro">${ev.length} events, append-only. Run state is never saved directly; it is rebuilt by replaying these in order.</p>` +
     ev.map((e) => `<details class="audit-item" data-open-id="a-${e.seq}"${ui.open.has(`a-${e.seq}`) ? ' open' : ''}><summary><span class="when">#${e.seq} ${time(e.at)} ${esc(e.actor)} ${e.type}</span><span class="line">${esc(describeEvent(e))}</span></summary><pre>${pretty(e)}</pre></details>`).join('');
@@ -314,6 +380,7 @@ app.innerHTML = `
       <button class="primary" data-act="run">Run</button>
       <button data-act="crash">Simulate crash + resume</button>
       <button data-act="cancel">Cancel run</button>
+      <button data-act="skip">Skip ahead</button>
       <button data-act="reset">Reset</button>
     </div>
   </section>
@@ -328,11 +395,14 @@ const panel = (t: Tab) => app.querySelector(`[data-panel="${t}"]`) as HTMLElemen
 const control = (act: string) => app.querySelector(`.controls [data-act="${act}"]`) as HTMLButtonElement;
 
 function render() {
-  const s = harness?.state;
-  const ended = !s || ['completed', 'failed', 'cancelled'].includes(s.status);
+  SHOWN = store.events.slice(0, ui.shown);
+  const s = SHOWN.length ? replay(SHOWN) : undefined;
+  const live = harness?.state;
+  const ended = !live || ['completed', 'failed', 'cancelled'].includes(live.status);
   control('run').disabled = !!harness;
   control('crash').disabled = !harness;
   control('cancel').disabled = ended;
+  control('skip').disabled = !live || (ui.shown >= store.events.length && !['running', 'executing'].includes(live.status));
   app.querySelector('#states')!.innerHTML = statesHtml(s);
   app.querySelector('#tabs')!.innerHTML = tabsHtml();
   panel('timeline').innerHTML = timelineHtml(s);
@@ -343,21 +413,18 @@ function render() {
     panel(t).classList.toggle('active', t === ui.tab);
     panel(t).classList.toggle('side', t === sideTab());
   }
-  follow(s);
 }
 
-function follow(s?: RunState) {
-  if (!ui.follow || !s || (ui.tab !== 'timeline' && !desktop.matches)) return;
+/** Follow the newest step, unless the reader has scrolled up to look at something. */
+function follow(near: boolean) {
+  if (!(ui.stick || near) || (ui.tab !== 'timeline' && !desktop.matches)) return;
   const tl = panel('timeline');
-  const gateEl = s.status === 'awaiting_approval' ? tl.querySelector('.gate:last-of-type') : null;
-  if (gateEl && ui.lastGate !== gateEl.id) {
-    ui.lastGate = gateEl.id;
-    ui.follow = false;
-    gateEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  } else if (s.status === 'running' || s.status === 'executing' || s.status === 'completed') {
-    tl.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    if (s.status === 'completed') ui.follow = false;
+  const gateEl = tl.querySelector<HTMLElement>('.gate.open');
+  if (gateEl) {
+    if (ui.lastGate !== gateEl.id) { ui.lastGate = gateEl.id; ui.stick = false; gateEl.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    return;
   }
+  tl.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 app.addEventListener('click', (ev) => {
@@ -398,7 +465,8 @@ app.addEventListener('click', (ev) => {
       if (!reason) { ui.errors[id] = 'Add a reason. It goes back to the model.'; return render(); }
       return decide(id, { type: 'reject', reason });
     }
-    case 'session2': ui.follow = true; return drive(harness!.startSession(SESSION_2_TEXT));
+    case 'skip': return skipAhead();
+    case 'session2': ui.stick = true; return drive(harness!.startSession(SESSION_2_TEXT));
   }
 });
 const saveDraft = (ev: Event) => {
@@ -412,6 +480,6 @@ document.addEventListener('toggle', (ev) => {
   const id = d.dataset?.openId;
   if (id) d.open ? ui.open.add(id) : ui.open.delete(id);
 }, true);
-for (const t of ['wheel', 'touchmove'] as const) addEventListener(t, () => { ui.follow = false; }, { passive: true });
+for (const t of ['wheel', 'touchmove'] as const) addEventListener(t, () => { ui.stick = false; }, { passive: true });
 desktop.addEventListener('change', render);
 reset();

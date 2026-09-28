@@ -16,7 +16,8 @@ const VIEWPORTS = [
   ['320x568', 'phones', 320, 568], ['360x740', 'phones', 360, 740], ['390x844', 'phones', 390, 844], ['412x915', 'phones', 412, 915],
   ['352x780', 'phones', 352, 780], ['352x780-text115', 'phones', 352, 780, 1.15], ['352x780-text130', 'phones', 352, 780, 1.3],
   ['1280x800', 'desktop', 1280, 800], ['1440x900', 'desktop', 1440, 900], ['1920x1080', 'desktop', 1920, 1080],
-].map(([id, group, w, h, text = 1]) => ({ id, group, w, h, text }));
+].map(([id, group, w, h, text = 1]) => ({ id, group, w, h, text }))
+  .filter((v) => !process.env.QA_VIEWPORTS || process.env.QA_VIEWPORTS.split(',').includes(v.id));
 
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
@@ -59,7 +60,7 @@ for (const vp of VIEWPORTS) {
   await page.goto(URL);
   if (vp.text !== 1) await page.addStyleTag({ content: `html { font-size: ${vp.text * 100}% !important; }` });
   const state = () => page.locator('#states li.current').innerText();
-  const waitState = (s) => page.waitForFunction((x) => document.querySelector('#states li.current')?.textContent?.trim() === x, s, { timeout: 20000 });
+  const waitState = (s) => page.waitForFunction((x) => document.querySelector('#states li.current')?.textContent?.trim() === x, s, { timeout: 45000 });
   const tab = async (t) => { if (phone || t !== 'timeline') await page.click(`#tabs [data-tab="${t}"]`); };
   const show = async (sel, last = false) => {
     await page.evaluate(([s, l]) => { const els = document.querySelectorAll(s); const el = l ? els[els.length - 1] : els[0]; el?.scrollIntoView({ block: 'start' }); }, [sel, last]);
@@ -74,6 +75,9 @@ for (const vp of VIEWPORTS) {
 
   await shot('01-initial');
   await page.click('.controls [data-act="run"]');
+  await page.waitForTimeout(2600);
+  const partial = await page.evaluate(() => document.querySelectorAll('[data-panel="timeline"] .step').length);
+  await shot('01b-paced', partial > 1 && partial < 8 ? [] : [`FLOW: pacing not visible (${partial} steps after 2.6 s)`]);
   await waitState('Awaiting approval');
   await show('.gate');
   await shot('02-gate');
@@ -98,12 +102,16 @@ for (const vp of VIEWPORTS) {
   await cards.nth(1).locator('[data-act="confirm-reject"]').click();
 
   await cards.nth(2).locator('[data-act="approve"]').click();
-  await page.waitForSelector('text=Retrying in', { timeout: 5000 });
+  await page.waitForSelector('text=Retrying in', { timeout: 30000 });
+  const backoff = await page.locator('.waiting').count();
   await page.click('.controls [data-act="crash"]');
   await page.waitForSelector('text=Sent exactly once', { timeout: 10000 });
   await show('.step.exec');
   const crashedMidRetry = await page.locator('text=Crash here.').count();
-  await shot('06-retry-and-crash', crashedMidRetry ? [] : ['FLOW: crash did not land inside the retry window']);
+  await shot('06-retry-and-crash', [...(crashedMidRetry ? [] : ['FLOW: crash did not land inside the retry window']), ...(backoff ? [] : ['FLOW: backoff wait not shown'])]);
+  await page.click('.controls [data-act="skip"]');
+  const skipped = await page.waitForFunction(() => document.querySelector('#states li.current')?.textContent?.trim() === 'Completed', null, { timeout: 4000 }).then(() => true, () => false);
+  if (!skipped) report.at(-1).issues.push('FLOW: Skip ahead did not finish the run quickly');
 
   await waitState('Completed');
   await page.waitForTimeout(400);
@@ -123,7 +131,7 @@ for (const vp of VIEWPORTS) {
   await tab('timeline');
   if (phone) await page.click('#tabs [data-tab="timeline"]');
   await page.click('[data-act="session2"]');
-  await page.waitForSelector('text=Going from the task memo', { timeout: 10000 });
+  await page.waitForSelector('text=Going from the task memo', { timeout: 20000 });
   await waitState('Completed');
   await show('.step', true);
   await page.evaluate(() => window.scrollBy(0, -window.innerHeight * 0.3));

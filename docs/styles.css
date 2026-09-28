@@ -68,6 +68,10 @@ button.link { border: 0; background: none; color: var(--accent); padding: 8px 0;
 .step.good { border-color: #bfe0cc; background: var(--good-soft); }
 .step.info { border-left: 4px solid var(--accent); }
 .step.pending { color: var(--muted); border-style: dashed; }
+.step.highlight { outline: 3px solid var(--accent); outline-offset: 2px; background: var(--accent-soft); }
+.waiting { color: var(--muted); }
+.waiting::after { content: ""; display: inline-block; width: 1.2em; animation: dots 1.2s steps(4, end) infinite; overflow: hidden; vertical-align: bottom; }
+.controls [data-act="reset"] { grid-column: span 2; }
 .step.pending::after { content: ""; display: inline-block; width: 1.2em; animation: dots 1.2s steps(4, end) infinite; overflow: hidden; vertical-align: bottom; }
 @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 
